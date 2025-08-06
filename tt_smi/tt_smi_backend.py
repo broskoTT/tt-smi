@@ -24,12 +24,16 @@ from rich.progress import track
 from tt_tools_common.ui_common.themes import CMD_LINE_COLOR
 from tt_tools_common.reset_common.wh_reset import WHChipReset
 from tt_tools_common.reset_common.bh_reset import BHChipReset
-from tt_tools_common.reset_common.gs_tensix_reset import GSTensixReset
 from tt_tools_common.reset_common.galaxy_reset import GalaxyReset
-from pyluwen import (
-    PciChip,
-    run_wh_ubb_ipmi_reset,
-    run_ubb_wait_for_driver_load
+from tt_umd import (
+    TTDevice,
+    wormhole,
+    blackhole,
+    create_remote_wormhole_tt_device,
+    RemoteWormholeTTDevice,
+    ClusterDescriptor,
+    ARCH,
+    PCIDevice,
 )
 from tt_tools_common.utils_common.system_utils import (
     get_host_info,
@@ -53,11 +57,13 @@ class TTSMIBackend:
 
     def __init__(
         self,
-        devices: List[PciChip],
+        umd_cluster_descriptor: ClusterDescriptor,
         fully_init: bool = True,
         pretty_output: bool = True,
     ):
-        self.devices = devices
+        # During transitioning period to UMD, the tool will hold both luwen and UMD devices.
+        self.construct_umd_devices(umd_cluster_descriptor)
+        self.umd_cluster_descriptor = umd_cluster_descriptor
         self.pretty_output = pretty_output
         self.log: log.TTSMILog = log.TTSMILog(
             time=datetime.datetime.now(),
@@ -71,7 +77,7 @@ class TTSMIBackend:
                     firmwares=log.Firmwares(),
                     limits=log.Limits(),
                 )
-                for device in self.devices
+                for device in self.umd_device_dict
             ],
         )
         self.smbus_telem_info = []
@@ -82,9 +88,9 @@ class TTSMIBackend:
         self.pci_properties = []
 
         if fully_init:
-            for i, device in track(
-                enumerate(self.devices),
-                total=len(self.devices),
+            for i, _ in track(
+                sorted(self.umd_device_dict.items()),
+                total=len(self.umd_device_dict),
                 description="Gathering Information",
                 update_period=0.01,
                 disable=not self.pretty_output,
@@ -96,16 +102,18 @@ class TTSMIBackend:
                 self.device_telemetrys.append(self.get_chip_telemetry(i))
                 self.chip_limits.append(self.get_chip_limits(i))
 
-    def get_device_name(self, device):
-        """Get device name from chip object"""
-        if device.as_gs():
-            return "Grayskull"
-        elif device.as_wh():
-            return "Wormhole"
-        elif device.as_bh():
-            return "Blackhole"
-        else:
-            assert False, "Unknown chip name, FIX!"
+    def construct_umd_devices(self, umd_cluster_descriptor):
+        # Note that mmio chips will always be first since they will have lower logical chip id.
+        # So if we're going in the sorted order, the chips will be created properly.
+        chips_to_construct = sorted(umd_cluster_descriptor.get_all_chips())
+        self.umd_device_dict = {}
+        chip_to_mmio_map = umd_cluster_descriptor.get_chips_with_mmio()
+        for chip in chips_to_construct:
+            if umd_cluster_descriptor.is_chip_mmio_capable(chip):
+                self.umd_device_dict[chip] = TTDevice.create(chip_to_mmio_map[chip])
+            else:
+                closest_mmio = umd_cluster_descriptor.get_closest_mmio_capable_chip(chip)
+                self.umd_device_dict[chip] = create_remote_wormhole_tt_device(self.umd_device_dict[closest_mmio], umd_cluster_descriptor, chip)
 
     def save_logs_to_file(self, result_filename: str = ""):
         """Save log for smi snapshots"""
@@ -139,13 +147,13 @@ class TTSMIBackend:
 
     def get_logs_json(self) -> str:
         """Get logs as JSON"""
-        for i, device in enumerate(self.devices):
+        for i, device in self.umd_device_dict.items():
             self.log.device_info[i].smbus_telem = self.smbus_telem_info[i]
             self.log.device_info[i].board_info = self.device_infos[i]
             # Add L/R for nb300 to separate local and remote asics
-            if device.as_wh():
+            if device.get_arch() == ARCH.WORMHOLE_B0:
                 board_type = self.device_infos[i]["board_type"]
-                suffix = " R" if device.is_remote() else " L"
+                suffix = " R" if self.umd_cluster_descriptor.is_chip_remote(i) else " L"
                 board_type = board_type + suffix
                 self.log.device_info[i].board_info["board_type"] = board_type
             self.log.device_info[i].telemetry = self.device_telemetrys[i]
@@ -162,19 +170,19 @@ class TTSMIBackend:
         table_1.add_column("Board Type")
         table_1.add_column("Device Series")
         table_1.add_column("Board Number")
-        for i, device in enumerate(self.devices):
+        for i, device in self.umd_device_dict.items():
             board_id = self.device_infos[i]["board_id"]
             board_type = self.device_infos[i]["board_type"]
             pci_dev_id = (
-                device.get_pci_interface_id() if not device.is_remote() else "N/A"
+                self.umd_cluster_descriptor.get_chips_with_mmio()[i] if self.umd_cluster_descriptor.is_chip_mmio_capable(i) else "N/A"
             )
-            if device.as_wh():
-                suffix = " R" if device.is_remote() else " L"
+            if device.get_arch() == ARCH.WORMHOLE_B0:
+                suffix = " R" if self.umd_cluster_descriptor.is_chip_remote(i) else " L"
                 board_type = board_type + suffix
 
             table_1.add_row(
                 f"{pci_dev_id}",
-                f"{self.get_device_name(device)}",
+                f"{device.get_arch()}",
                 f"{board_type}",
                 f"{board_id}",
             )
@@ -184,20 +192,20 @@ class TTSMIBackend:
         table_2.add_column("Board Type")
         table_2.add_column("Device Series")
         table_2.add_column("Board Number")
-        for i, device in enumerate(self.devices):
+        for i, device in self.umd_device_dict.items():
             if (
-                not device.is_remote()
+                self.umd_cluster_descriptor.is_chip_mmio_capable(i)
                 and self.device_infos[i]["board_type"] != "wh_4u"
             ):
                 board_id = self.device_infos[i]["board_id"]
                 board_type = self.device_infos[i]["board_type"]
-                pci_dev_id = device.get_pci_interface_id()
-                if device.as_wh():
-                    suffix = " R" if device.is_remote() else " L"
+                pci_dev_id = self.umd_cluster_descriptor.get_chips_with_mmio()[i]
+                if device.get_arch() == ARCH.WORMHOLE_B0:
+                    suffix = " R" if self.umd_cluster_descriptor.is_chip_remote(i) else " L"
                     board_type = board_type + suffix
                 table_2.add_row(
                     f"{pci_dev_id}",
-                    f"{self.get_device_name(device)}",
+                    f"{device.get_arch()}",
                     f"{board_type}",
                     f"{board_id}",
                 )
@@ -205,30 +213,28 @@ class TTSMIBackend:
 
     def get_smbus_board_info(self, board_num: int) -> Dict:
         """Update board info by reading SMBUS_TELEMETRY"""
-        pyluwen_chip = self.devices[board_num]
-        if pyluwen_chip.as_bh():
-            telem_struct = pyluwen_chip.as_bh().get_telemetry()
-        elif pyluwen_chip.as_wh():
-            telem_struct = pyluwen_chip.as_wh().get_telemetry()
-        else:
-            telem_struct = pyluwen_chip.as_gs().get_telemetry()
-        json_map = dict_from_public_attrs(telem_struct)
-        smbus_telem_dict = dict.fromkeys(constants.SMBUS_TELEMETRY_LIST)
+        smbus_telem_dict = {}
+        tag_collection = {
+            ARCH.BLACKHOLE: blackhole.TelemetryTag,
+            ARCH.WORMHOLE_B0: wormhole.TelemetryTag,
+        }.get(self.umd_device_dict[board_num].get_arch())
 
-        for key, value in json_map.items():
-            if value:
-                smbus_telem_dict[key.upper()] = hex(value)
+        telem_reader = self.umd_device_dict[board_num].get_arc_telemetry_reader()
+        for telem_key in tag_collection:
+            telem_value = hex(telem_reader.read_entry(telem_key.value)) if telem_reader.is_entry_available(telem_key.value) else None
+            smbus_telem_dict[telem_key.name] = telem_value
+                    
         return smbus_telem_dict
 
     def update_telem(self):
         """Update telemetry in a given interval"""
-        for i, _ in enumerate(self.devices):
+        for i in self.umd_device_dict:
             self.smbus_telem_info[i] = self.get_smbus_board_info(i)
             self.device_telemetrys[i] = self.get_chip_telemetry(i)
 
     def get_board_id(self, board_num) -> str:
         """Read board id from CSM or SPI if FW is not loaded"""
-        if self.smbus_telem_info[board_num]["BOARD_ID"]:
+        if "BOARD_ID" in self.smbus_telem_info[board_num] and self.smbus_telem_info[board_num]["BOARD_ID"]:
             board_id = self.smbus_telem_info[board_num]["BOARD_ID"]
             return (f"{board_id}").replace("0x", "")
         else:
@@ -243,9 +249,6 @@ class TTSMIBackend:
 
     def get_dram_speed(self, board_num) -> int:
         """Read DRAM Frequency from CSM and alternatively from SPI if FW not loaded on chip"""
-        if self.devices[board_num].as_gs():
-            val = int(self.smbus_telem_info[board_num]["DDR_SPEED"], 16)
-            return f"{val}"
         if self.smbus_telem_info[board_num]["DDR_STATUS"] is not None:
             dram_speed_raw = (
                 int(self.smbus_telem_info[board_num]["DDR_STATUS"], 16) >> 24
@@ -266,11 +269,11 @@ class TTSMIBackend:
 
     def get_pci_properties(self, board_num):
         """Get the PCI link speed and link width details from sysfs files"""
-        if self.devices[board_num].is_remote():
+        if self.umd_cluster_descriptor.is_chip_remote(board_num):
             return {prop: "N/A" for prop in constants.PCI_PROPERTIES}
 
         try:
-            pcie_bdf = self.devices[board_num].get_pci_bdf()
+            pcie_bdf = self.umd_device_dict[board_num].get_pci_device().get_device_info().get_pci_bdf()
             pci_bus_path = os.path.realpath(f"/sys/bus/pci/devices/{pcie_bdf}")
         except:
             return {prop: "N/A" for prop in constants.PCI_PROPERTIES}
@@ -306,7 +309,7 @@ class TTSMIBackend:
     def get_dram_training_status(self, board_num) -> bool:
         """Get DRAM Training Status
         True means it passed training, False means it failed or did not train at all"""
-        if self.devices[board_num].as_wh():
+        if self.umd_device_dict[board_num].get_arch() == ARCH.WORMHOLE_B0:
             num_channels = 8
             for i in range(num_channels):
                 if self.smbus_telem_info[board_num]["DDR_STATUS"] is None:
@@ -317,25 +320,14 @@ class TTSMIBackend:
                 if dram_status != 2:
                     return False
                 return True
-        elif self.devices[board_num].as_gs():
-            num_channels = 6
-            for i in range(num_channels):
-                if self.smbus_telem_info[board_num]["DDR_STATUS"] is None:
-                    return False
-                dram_status = (
-                    int(self.smbus_telem_info[board_num]["DDR_STATUS"], 16) >> (4 * i)
-                ) & 0xF
-                if dram_status != 1:
-                    return False
-                return True
 
     def get_device_info(self, board_num) -> dict:
         dev_info = {}
         for field in constants.DEV_INFO_LIST:
             if field == "bus_id":
-                try:
-                    dev_info[field] = self.devices[board_num].get_pci_bdf()
-                except:
+                if self.umd_cluster_descriptor.is_chip_mmio_capable(board_num):
+                    dev_info[field] = self.umd_device_dict[board_num].get_pci_device().get_device_info().get_pci_bdf()
+                else:
                     dev_info[field] = "N/A"
             elif field == "board_type":
                 if self.get_board_id(board_num) == "N/A":
@@ -345,10 +337,11 @@ class TTSMIBackend:
             elif field == "board_id":
                 dev_info[field] = self.get_board_id(board_num)
             elif field == "coords":
-                if self.devices[board_num].as_wh():
+                if self.umd_device_dict[board_num].get_arch() == ARCH.WORMHOLE_B0:
+                    eth_coord = self.umd_cluster_descriptor.get_chip_locations()[board_num]
                     dev_info[
                         field
-                    ] = f"({self.devices[board_num].as_wh().get_local_coord().shelf_x}, {self.devices[board_num].as_wh().get_local_coord().shelf_y}, {self.devices[board_num].as_wh().get_local_coord().rack_x}, {self.devices[board_num].as_wh().get_local_coord().rack_y})"
+                    ] = f"({eth_coord.x}, {eth_coord.y}, {eth_coord.rack}, {eth_coord.shelf})"
                 else:
                     dev_info[field] = "N/A"
             elif field == "dram_status":
@@ -433,43 +426,17 @@ class TTSMIBackend:
 
         return chip_telemetry
 
-    def get_gs_chip_telemetry(self, board_num) -> Dict:
-        """Get telemetry data for GS chip. None if ARC FW not running"""
-        current = int(self.smbus_telem_info[board_num]["TDC"], 16) & 0xFFFF
-        if self.smbus_telem_info[board_num]["VCORE"] is not None:
-            voltage = int(self.smbus_telem_info[board_num]["VCORE"], 16) / 1000
-        else:
-            voltage = 10000
-        power = int(self.smbus_telem_info[board_num]["TDP"], 16) & 0xFFFF
-        asic_temperature = (
-            int(self.smbus_telem_info[board_num]["ASIC_TEMPERATURE"], 16) & 0xFFFF
-        ) / 16
-        aiclk = int(self.smbus_telem_info[board_num]["AICLK"], 16) & 0xFFFF
-        arc0_heartbeat = int(self.smbus_telem_info[board_num]["ARC0_HEALTH"], 16) // 1000 # Watchdog heartbeat, ~2 per second
-
-        chip_telemetry = {
-            "voltage": f"{voltage:4.2f}",
-            "current": f"{current:5.1f}",
-            "power": f"{power:5.1f}",
-            "aiclk": f"{aiclk:4.0f}",
-            "asic_temperature": f"{asic_temperature:4.1f}",
-            "heartbeat": f"{arc0_heartbeat}"
-        }
-
-        return chip_telemetry
-
     def get_chip_telemetry(self, board_num) -> Dict:
         """Return the correct chip telemetry for a given board"""
-        if self.devices[board_num].as_bh():
+        arch = self.umd_device_dict[board_num].get_arch()
+        if arch == ARCH.BLACKHOLE:
             return self.get_bh_chip_telemetry(board_num)
-        elif self.devices[board_num].as_gs():
-            return self.get_gs_chip_telemetry(board_num)
-        elif self.devices[board_num].as_wh():
+        elif arch == ARCH.WORMHOLE_B0:
             return self.get_wh_chip_telemetry(board_num)
         else:
             print(
                 CMD_LINE_COLOR.RED,
-                f"Could not fetch telemetry for board {e}: Unrecognized board type!",
+                f"Could not fetch telemetry for board {arch}: Unrecognized board type!",
                 CMD_LINE_COLOR.ENDC,
             )
             return {}
@@ -537,14 +504,16 @@ class TTSMIBackend:
         fw_versions = {}
         for field in constants.FW_LIST:
             if field == "cm_fw":
-                val = self.smbus_telem_info[board_num]["ARC0_FW_VERSION"]
+                if "ARC0_FW_VERSION" in self.smbus_telem_info[board_num]:
+                    val = self.smbus_telem_info[board_num]["ARC0_FW_VERSION"]
                 if val is None:
                     fw_versions[field] = "N/A"
                 else:
                     fw_versions[field] = hex_to_semver_m3_fw(int(val, 16))
 
             elif field == "cm_fw_date":
-                val = self.smbus_telem_info[board_num]["WH_FW_DATE"]
+                if "WH_FW_DATE" in self.smbus_telem_info[board_num]:
+                    val = self.smbus_telem_info[board_num]["WH_FW_DATE"]
                 if val is None:
                     fw_versions[field] = "N/A"
                 else:
@@ -557,19 +526,28 @@ class TTSMIBackend:
                 else:
                     fw_versions[field] = hex_to_semver_eth(int(val, 16))
             elif field == "bm_bl_fw":
-                val = self.smbus_telem_info[board_num]["M3_BL_FW_VERSION"]
+                # The tag has different value for WH and BH
+                if "M3_BL_FW_VERSION" in self.smbus_telem_info[board_num]:
+                    val = self.smbus_telem_info[board_num]["M3_BL_FW_VERSION"]
+                if "BM_BL_FW_VERSION" in self.smbus_telem_info[board_num]:
+                    val = self.smbus_telem_info[board_num]["BM_BL_FW_VERSION"]
                 if val is None:
                     fw_versions[field] = "N/A"
                 else:
                     fw_versions[field] = hex_to_semver_m3_fw(int(val, 16))
             elif field == "bm_app_fw":
-                val = self.smbus_telem_info[board_num]["M3_APP_FW_VERSION"]
+                # The tag has different value for WH and BH
+                if "M3_APP_FW_VERSION" in self.smbus_telem_info[board_num]:
+                    val = self.smbus_telem_info[board_num]["M3_APP_FW_VERSION"]
+                if "BM_APP_FW_VERSION" in self.smbus_telem_info[board_num]:
+                    val = self.smbus_telem_info[board_num]["BM_APP_FW_VERSION"]
                 if val is None:
                     fw_versions[field] = "N/A"
                 else:
                     fw_versions[field] = hex_to_semver_m3_fw(int(val, 16))
             elif field == "tt_flash_version":
-                val = self.smbus_telem_info[board_num]["TT_FLASH_VERSION"]
+                if "TT_FLASH_VERSION" in self.smbus_telem_info[board_num]:
+                    val = self.smbus_telem_info[board_num]["TT_FLASH_VERSION"]
                 if val is None:
                     fw_versions[field] = "N/A"
                 # See below- Galaxy systems manually get an N/A tt_flash_version
@@ -578,7 +556,11 @@ class TTSMIBackend:
                 else:
                     fw_versions[field] = hex_to_semver_m3_fw(int(val, 16))
             elif field == "fw_bundle_version":
-                val = self.smbus_telem_info[board_num]["FW_BUNDLE_VERSION"]
+                # The tag has different value for WH and BH
+                if "FW_BUNDLE_VERSION" in self.smbus_telem_info[board_num]:
+                    val = self.smbus_telem_info[board_num]["FW_BUNDLE_VERSION"]
+                elif "FLASH_BUNDLE_VERSION" in self.smbus_telem_info[board_num]:
+                    val = self.smbus_telem_info[board_num]["FLASH_BUNDLE_VERSION"]
                 if (
                     get_board_type(self.get_board_id(board_num)) == "wh_4u"
                     and val == "0xffffffff"
@@ -594,23 +576,6 @@ class TTSMIBackend:
                 else:
                     fw_versions[field] = hex_to_semver_m3_fw(int(val, 16))
         return fw_versions
-
-    def gs_tensix_reset(self, board_num) -> None:
-        """Reset the Tensix cores on a GS chip"""
-        print(
-            CMD_LINE_COLOR.BLUE,
-            f"Starting Tensix reset on GS board at PCI index {board_num}",
-            CMD_LINE_COLOR.ENDC,
-        )
-        device = self.devices[board_num]
-        # Init reset object and call reset
-        GSTensixReset(device).tensix_reset()
-
-        print(
-            CMD_LINE_COLOR.GREEN,
-            f"Finished Tensix reset on GS board at PCI index {board_num}\n",
-            CMD_LINE_COLOR.ENDC,
-        )
 
 
 def get_board_type(board_id: str) -> str:
@@ -676,7 +641,7 @@ def dict_from_public_attrs(obj) -> dict:
 def get_host_software_versions() -> dict:
     return {
         "tt_smi": pkg_resources.get_distribution("tt_smi").version,
-        "pyluwen": pkg_resources.get_distribution("pyluwen").version,
+        "tt_umd": pkg_resources.get_distribution("tt_umd").version,
     }
 
 
@@ -687,8 +652,6 @@ def pci_indices_from_json(json_dict):
     """Parse pci_list from reset json"""
     pci_indices = []
     reinit = False
-    if "gs_tensix_reset" in json_dict.keys():
-        pci_indices.extend(json_dict["gs_tensix_reset"]["pci_index"])
     if "wh_link_reset" in json_dict.keys():
         pci_indices.extend(json_dict["wh_link_reset"]["pci_index"])
     if "re_init_devices" in json_dict.keys():
@@ -731,11 +694,11 @@ def pci_board_reset(list_of_boards: List[int], reinit=False):
     """Given a list of PCI index's init the PCI chip and call reset on it"""
 
     reset_wh_pci_idx = []
-    reset_gs_devs = []
     reset_bh_pci_idx = []
+    device_infos = PCIDevice.enumerate_devices_info()
     for pci_idx in list_of_boards:
         try:
-            chip = PciChip(pci_interface=pci_idx)
+            arch = device_infos[pci_idx].get_arch()
         except Exception as e:
             print(
                 CMD_LINE_COLOR.RED,
@@ -744,11 +707,9 @@ def pci_board_reset(list_of_boards: List[int], reinit=False):
             )
             # Exit the loop to go to the next chip
             continue
-        if chip.as_wh():
+        if arch == ARCH.WORMHOLE_B0:
             reset_wh_pci_idx.append(pci_idx)
-        elif chip.as_gs():
-            reset_gs_devs.append(chip)
-        elif chip.as_bh():
+        elif arch == ARCH.BLACKHOLE:
             reset_bh_pci_idx.append(pci_idx)
         else:
             print(
@@ -761,12 +722,6 @@ def pci_board_reset(list_of_boards: List[int], reinit=False):
     # reset wh devices with pci indices
     if reset_wh_pci_idx:
         reset_devices = WHChipReset().full_lds_reset(pci_interfaces=reset_wh_pci_idx)
-
-    # reset gs devices by creating a partially init backend
-    if reset_gs_devs:
-        backend = TTSMIBackend(devices=reset_gs_devs, fully_init=False)
-        for i, _ in enumerate(reset_gs_devs):
-            backend.gs_tensix_reset(i)
 
     if reset_bh_pci_idx:
         BHChipReset().full_lds_reset(pci_interfaces=reset_bh_pci_idx)
@@ -823,10 +778,10 @@ def check_wh_galaxy_eth_link_status(devices):
     # Collect all the link errors in a dictionary
     link_errors = {}
     # Check all 16 eth links for all devices
-    for i, device in enumerate(devices):
+    for i, device in self.umd_device_dict.items():
         for eth in range(16):
             eth_x, eth_y = eth_locations_noc_0[eth]
-            link_error = device.noc_read32(noc_id, eth_x, eth_y, DEBUG_BUF_ADDR + 0x4*96)
+            link_error = device.noc_read32(eth_x, eth_y, DEBUG_BUF_ADDR + 0x4*96)
             if link_error == LINK_INACTIVE_FAIL_DUMMY_PACKET:
                 link_errors[i] = eth
 
