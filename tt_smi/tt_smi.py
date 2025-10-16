@@ -24,6 +24,7 @@ from importlib_resources import files
 from pyluwen import pci_scan
 from tt_umd import (
     TopologyDiscovery,
+    IODeviceType,
 )
 from textual.app import App, ComposeResult
 from textual.css.query import NoMatches
@@ -799,6 +800,12 @@ def parse_args():
         action="store_true",
         help="Use UMD instead of Luwen driver.",
     )
+    parser.add_argument(
+        "--use_jtag",
+        default=False,
+        action="store_true",
+        help="Use JTAG instead of PCI.",
+    )
     args = parser.parse_args()
     return args
 
@@ -1004,7 +1011,10 @@ def main():
 
     try:
         if args.use_umd:
-            devices = TopologyDiscovery.create_cluster_descriptor()
+            if args.use_jtag:
+                devices = TopologyDiscovery.create_cluster_descriptor(device_type=IODeviceType.JTAG)
+            else:
+                devices = TopologyDiscovery.create_cluster_descriptor()
         else:
             devices = detect_chips_with_callback(
                 local_only=args.local, ignore_ethernet=args.local, print_status=is_tty
@@ -1024,7 +1034,7 @@ def main():
         )
         sys.exit(1)
     if args.use_umd:
-        backend = TTSMIBackend(umd_cluster_descriptor=devices, pretty_output=is_tty)
+        backend = TTSMIBackend(umd_cluster_descriptor=devices, pretty_output=is_tty, use_jtag=args.use_jtag)
     else:
         backend = TTSMIBackend(devices=devices, pretty_output=is_tty)
         # Check firmware version before running tt_smi to avoid crashes.

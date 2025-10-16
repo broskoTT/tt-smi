@@ -38,6 +38,7 @@ from tt_umd import (
     create_remote_wormhole_tt_device,
     ClusterDescriptor,
     ARCH,
+    IODeviceType
 )
 from tt_tools_common.utils_common.system_utils import (
     get_host_info,
@@ -65,9 +66,11 @@ class TTSMIBackend:
         umd_cluster_descriptor: Optional[ClusterDescriptor] = None,
         fully_init: bool = True,
         pretty_output: bool = True,
+        use_jtag: bool = False,
     ):
         self.devices = devices
         self.use_umd = umd_cluster_descriptor is not None
+        self.use_jtag = use_jtag
         if (self.use_umd):
             self.umd_cluster_descriptor = umd_cluster_descriptor
             self.construct_umd_devices()
@@ -159,10 +162,10 @@ class TTSMIBackend:
         # Note that we have to create mmio chips first, since they are passed to the construction of the remote chips.
         chips_to_construct = self.umd_cluster_descriptor.get_chips_local_first(self.umd_cluster_descriptor.get_all_chips())
         self.umd_device_dict = {}
-        for chip in chips_to_construct:
+        for chip in sorted(chips_to_construct):
             if self.umd_cluster_descriptor.is_chip_mmio_capable(chip):
                 pci_device_num = self.umd_cluster_descriptor.get_chips_with_mmio()[chip]
-                self.umd_device_dict[chip] = TTDevice.create(pci_device_num)
+                self.umd_device_dict[chip] = TTDevice.create(chip, IODeviceType.JTAG if self.use_jtag else IODeviceType.PCIe)
             else:
                 closest_mmio = self.umd_cluster_descriptor.get_closest_mmio_capable_chip(chip)
                 self.umd_device_dict[chip] = create_remote_wormhole_tt_device(self.umd_device_dict[closest_mmio], self.umd_cluster_descriptor, chip)
